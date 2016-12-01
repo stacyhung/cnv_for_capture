@@ -1,0 +1,410 @@
+---
+title: "Application of Copywrite R to predict copy number variants in Capture sequence"
+author: "Stacy Hung"
+date: "January 5, 2016"
+output: html_document
+---
+  
+## Objectives 
+  
+* Install CopywriteR (formerly known as ENCODER) and apply to test dataset.
+* Apply CopywriteR to Capture sequence for a single tumor-normal sample from Genome Canada
+* If above sample works, develop pipeline that can process CopywriteR to batches of T-N samples.
+
+```{r}
+# load appropriate libaries
+source ("http://bioconductor.org/biocLite.R")
+biocLite("CopywriteR")
+library("CopywriteR")
+```
+
+## CopywriteR - test the analysis workflow provided by vignette
+
+The full analysis of copy number of data with CopywriteR includes the following 3 steps:
+1. preCopywriteR()
+2. CopywriteR()
+3. plotCNA()
+
+Test analysis workflow: extract copy number information from whole-exome sequencing data from a murine small-cell lung cancer (downloadable from http://www.ebi.ac.uk/ena/home) - accession PRJEB6954. Only sequence reads on Chr4 are used.
+
+CopywriteR uses off-target sequence reads from targeted sequencing to create copy number profiles.  First, it discards reads that map to genomic regions covered by capture baits and sequences adjacent to these capture regions.  Next, the number of reads that map to consecutive windows (bins) of a specified size (e.g. 20kb or 20000 bp) is calculated to obtain *depth of coverage*. The Model-based Analysis for ChIPseq (MACS) algorithm is applied to detect peaks in germline samples.
+
+###  Workflow:
+
+# Part I: Removal of enriched regions
+(1) Reads filtered for phred score > 37, and reads that map in pairs [SAMtools]
+(2) Genomic regions enriched for sequencing reads (peaks) are identified in reference samples using MACS (Model-based Analysis for ChIPseq) [MACS 1.4]
+(3) reads corresponding to peak regions (from step 2) represent parts of the genome that are targeted by Capture probes and are therefore discarded in both sample and reference [bedtools]
+
+# Part II: Calculation of DOC ratios
+(1) DOC is calculated for genome-wide 20kb bins (unless otherwise indicated) [Rsamtools]
+(2) DOC is compensated for by removal of effective bin sizes
+(3) DOC is corrected for GC-content and mappability [loess normalization]
+(4) DOC is median-normalized and log2 transformed 
+(5) Subtraction of log2-transformed, corrected, and compensated DOC of reference sample (for creating relative copy number profiles)
+(6) Reporting in log files
+
+CopywriteR overcomes limitations of methods based on exonic *depth of coverage*, which suffer from the problems that bait efficiencies are non-uniform and that exons are irregularly distributed over the genome (off-target sequence reads are uniformly distributed over the genome).
+
+```{r}
+# file paths:
+output.folder <- file.path("~/Documents/projects/GenomeCanada/CNV_for_Capture_analysis/CopywriteR/preCopywriteRoutput/")
+bam_path <- "/Users/shung/Documents/bam/Capture_GPH_9/test"
+results.folder <- file.path("~/Documents/projects/GenomeCanada/CNV_for_Capture_analysis/CopywriteR/results/")
+reference.folder <- file.path("~/Documents/projects/GenomeCanada/CNV_for_Capture_analysis/CopywriteR/preCopywriteRoutput", "hg19_100kb_chr")
+
+# we only need the bed file for the capture regions if we want stats on the MACS calls.
+capture.regions.file <- file.path("~/Documents/projects/GenomeCanada/data/Capture_V2/0710331_Covered_no_header.bed")
+
+# Step 1: Load copywriteR
+library (CopywriteR)
+
+# Step 2: Run preCopywriteR
+# This function is used to generate helper files (blacklist, bin region, GC-content, and mappability .bed files) for the desired bin size from pre-assembled 1 kb helper files.
+# Note that a bin size is appropriate for WES data, while 50kb bins are recommended for targeted sequencing with a small gene panel.
+
+BIN_SIZE = 100000;
+
+preCopywriteR(output.folder = output.folder,
+              bin.size = 100000,
+              ref.genome = "hg19",
+              prefix = "chr")
+# Output values:
+#
+# blacklist.rda: an R data file containing a GRanges object with blacklisted regions of known CNVs
+# GC.mappability.rda: an R data file containing a GRanges object with mappability and GC-content for bins of the specified size.
+
+# Step 3: Specify the settings for parallel computing.
+# One way to do this is through the use of the BiocParallel package that enables us to define how parallel computation is executed - in this case, we use a SnowParam instance of BiocParallelParam which specifies the use of 12 CPUs.
+bp.param <- SnowParam(workers = 12, type = "SOCK")
+
+# Step 4: Specify which samples and controls correspond to each other using the sample.control variable. For the CopywriteR function, controls are specified as those samples that will be used to identify which regions are 'peaks' and contain on-target reads.
+setwd(bam_path)
+samples <- list.files(path = bam_path, pattern = "bam$", full.names = FALSE)
+# indices of control samples (i.e. normal samples) are all even indices (e.g. 2, 4, 6, ...)
+controls <- samples[rep(seq(2, length(samples), 2), each = 2)]
+sample.control <- data.frame(samples, controls)
+
+# Step 5: Run CopywriteR
+# Arguments:
+#
+# sample.control: df/mat containing locations of sample + control bams, respectively, in columns.
+# destination.folder: path for writing output; absolute or relative
+# reference.folder: path to folder for helper files generated by preCopywriteR()
+# bp.param: a BiocParallelParam instance that determines the settings used for parallel computing
+# capture.regions.file (OPTIONAL): path to the capture regions file (.bed); if included, stats on the overlap of peaks called by MACS and the capture regions will be provided.
+# keep.intermediary.files (OPTIONAL) - logical that indicates whether intermediary .bam, .bai and peak regions files should be kept after the analysis is done.  Default is FALSE.
+
+# make sure the results folder exists (but is empty) before running this command
+CopywriteR(sample.control = sample.control,
+           destination.folder = results.folder, 
+           reference.folder = reference.folder,
+           bp.param = bp.param)
+
+# Output files:
+#
+# BamBaiPeaksFiles: peak regions files created during the CopywriteR run (folder will be created when keep.intermediary.files = FALSE)
+# input.Rdata: R object that contains information for plotCNA()
+# log2_read_counts.igv: file that contains the compensated corrected read counts after GC-content and mappability corrections, and after removal of data points listed in the blacklisted regions. Counts are log2-transformed.  File is tab-delimited and can be viewed in IGV.
+# qc: folder with quality control files - produces these two files:
+# (1) fraction.of.bin - contains empirical cumulative distribution function for 'fraction of bins'
+# (2) read.counts.compensated - contains plots and loesses used for GC-content + mappability correction
+# read_counts.txt: the file that contains the raw and compensated read conuts per bin
+
+# Step 6: Segment data using DNAcopy and plot the result using the plotCNA function
+plotCNA(destination.folder = file.path("~/Documents/projects/GenomeCanada/CNV_for_Capture_analysis/CopywriteR/results"))
+
+# Note that every sample is plotted both with and without a reference (default is sample.controls)
+```
+
+Description of the plots:
+- left hand corner: size of bins that is used to calculate GC-content, mappability, and depth of coverage
+- right hand corner: mad score (Median Absolute Deviation) (calculated using madDiff from the R package matrixStats) - takes in account that there are changes in the 'signal' (e.g. when there is a gain/loss).  The mad value is an indicator of quality of the copy number plot; values < 0.35-0.40 are of decent quality.  If the mad value is higher, there is the option to decrease resolution by increasing bin size --> results in less noisiness of the data (and subsequently also lowering the mad value).  In short, the mad value is used as a guide for having high resolution vs. less noise.
+
+
+## Copy number calling using CGHcall
+
+We will use a separate package / method to get the actual copy number calls. We will apply the workflow as suggested by the developers of CopywriteR.
+
+```{r}
+# downlaod the package from the Bioconductor website
+source ("http://bioconductor.org/biocLite.R")
+biocLite("CGHcall")
+# load the package
+library(CGHcall)
+
+# import data from CopywriteR
+setwd("/Users/shung/Documents/projects/GenomeCanada/CNV_for_Capture_analysis/CopywriteR/results/CNAprofiles")
+data <- read.table(file="log2_read_counts.igv", sep="\t", header=TRUE, quote="", fill=TRUE, skip=1)
+
+# Change order of annotation columns (IGV to standard format)
+Corrected_logratio <- data[,c(4,1,2,3,5:ncol(data))]
+
+# The following code is similar to the examples provided in the CGHcall manual:
+# Preprocessing of raw copy number data:
+raw <- make_cghRaw(Corrected_logratio)
+prep <- preprocess(raw, maxmiss = 30, nchrom = 22)
+nor <-  normalize(prep,method = "median", smoothOutliers = TRUE)  
+
+#######################################################
+# Segmentation using Circular Binary Segmentation (CBS)
+#######################################################
+# Topics to explore:
+# 1. Do we need to apply this step (since CopywriteR is able to perform segmentation)?
+# 2. Currently, the algorithm "DNAcopy" is being used for segmentation - what other methods can be used? 
+# 3. If DNAcopy is the best segmentation method, what parameters can be modified that may potentially improve the calls?
+seg <-  segmentData(nor, method = "DNAcopy",nperm=2000,undo.splits="sdundo",min.width=5,undo.SD=2, clen=25, relSDlong=5)
+
+segnorm <- postsegnormalize(seg,inter=c(-0.4,0.4))
+listcalls <- CGHcall(segnorm,nclass=5,robustsig="yes",cellularity=1,ncpus=4)
+results <- ExpandCGHcall(listcalls,segnorm, divide=5, memeff=FALSE)
+save(results, file="CGHcall_output.Rdata")  
+
+NUM_SAMPLES <- length(sampleNames(results))
+
+# plots - print to PDF
+
+# visualize the results for each sample - plot individually, but save to single pdf file
+pdf("CGHcall_plots.pdf", width = 8, height = 6)
+for (i in 1:NUM_SAMPLES) {
+  plot(results[,i])
+}
+
+# Summary plot (for all the samples)  
+summaryPlot(results)
+
+# Frequency plot for all samples - very similar to summary plot
+#frequencyPlotCalls(results)
+
+dev.off()
+
+# the following output files are generated once, and contain data of interest for all samples
+
+# To extract calls (-2, -1, 0, 1, 2) from the output:
+calls.matrix <- calls(results)
+write.table(calls.matrix, "CGHcall-calls.txt", sep="\t")
+
+# Segmented values:
+segmented.values <- segmented(results)
+write.table(segmented.values, "CGHcall-segmented_values.txt", sep="\t")
+
+# Raw copy number values:
+raw.cn.values <- copynumber(results)
+write.table(raw.cn.values, "CGHcall-raw.cn.values.txt", sep="\t")
+
+# Annotation info:
+#chr.info <- chromosomes(results)
+#write.table(chr.info, "CGHcall-chr.info.txt", sep="\t")
+```
+
+## Analysis of call data
+
+```{r}
+
+# read in the calls
+#calls_V1 <- read.table("~/Documents/projects/GenomeCanada/CNV_for_Capture_analysis/CopywriteR/results/CNAprofiles_CaptureV1/CGHcall-calls.txt", sep = "\t", header = TRUE)
+calls_V1 <- read.table("~/Documents/projects/GenomeCanada/CNV_for_Capture_analysis/CopywriteR/results/CNAprofiles_CAPTURE_GT8+GPHreplica2/CGHcall-calls.txt", sep = "\t", header = TRUE)
+
+
+# extract only the calls for the tumor samples (normal should all be normal copy number)
+calls_V1.tumor <- calls_V1[,seq(1, ncol(calls_V1), by = 2)]
+
+# get counts of each copy number state (-2, -1, 0, 1, or 2) for each segment (e.g. chrX:X-X)
+# Output will be a list (each element is the counts of the copy number states); each list element is a segment
+call_counts_per_segment <- apply (calls_V1.tumor, MARGIN = 1, table)
+
+# convert list to data frame for easier output
+df <- do.call("rbind", lapply(call_counts_per_segment, as.data.frame))
+
+# write out the results to output
+write.table(df, "~/Documents/projects/GenomeCanada/CNV_for_Capture_analysis/CopywriteR/results/CNAprofiles_CAPTURE_GT8+GPHreplica2/call_counts_per_segment.df.txt", sep = "\t")
+
+### in terminal, (1) clean up segment names (e.g. remove '.X' from chr2:96100001-96200000.X)
+# [this can be done in vi by replacing "\.[1-5]" with blanks]
+# and (2) add new header row: segment, class, freq
+
+# read in cleaned up data
+df.clean <- read.table("~/Documents/projects/GenomeCanada/CNV_for_Capture_analysis/CopywriteR/results/CNAprofiles_CAPTURE_GT8+GPHreplica2/call_counts_per_segment.df.txt", sep="\t", header = TRUE)
+
+# use dplyr to convert long to wide format
+library(tidyr)
+df.clean.wide <- spread(df.clean, class, freq)
+
+# replace NA values with 0
+df.clean.wide[is.na(df.clean.wide)] <- 0
+
+# make the segments the row names (so they don't get confused with data values)
+df.premat <- df.clean.wide[,-1]
+rownames(df.premat) <- df.clean.wide[,1]
+
+# convert to data matrix for visulization as heatmap
+mat.clean <- data.matrix(df.premat)
+```
+
+## Visualization
+
+```{r}
+library(RColorBrewer)
+library(gplots)
+library(ggplot2)
+
+colors = c(seq(0, 10, length=250), seq(11, 40, length=50))
+my_palette <- colorRampPalette(c("blue", "red"))(n = 299)
+col_side_colors <- c(rep("purple", 2), rep("orange", 1), rep("green", 2))
+colnames(mat.clean) <- c("Double loss", "Loss", "Normal", "Gain", "Amplification")
+
+# split heatmap into two parts (since too much data for heatmap to handle)
+#calls_part1 <- mat.clean[1:12758,]
+#calls_part2 <- mat.clean[12759:25457,]
+calls_part2 <- mat.clean
+
+lmat <- rbind( c(5,3,4), c(2,1,4) )
+lhei <- c(1.5, 4)
+lwid <- c(1.5, 4, 0.75)
+heatmap.2(calls_part2, 
+          col = my_palette, 
+          ColSideColors = col_side_colors,
+          breaks = colors, 
+          trace = "none", 
+          density.info = "none", 
+          Colv = NA, 
+          dendrogram="none", 
+          labRow = NA, 
+          symm = F, 
+          symbreaks = T, 
+          scale = "none",
+          lmat=lmat, lhei=lhei, lwid=lwid)
+
+# add legend for column side colours:
+legend("topright", inset = c(0,-0.05), legend = c("Losses", "Normal", "Gains"), col = c("purple", "orange", "green"), lty = 1, lwd = 10)
+
+# boxplot distribution of numbers of each copy number state
+# first need to convert from wide to long data format
+df.clean.v2 <- data.frame(mat.clean)
+# we can't have number columns for a data frame
+colnames(df.clean.v2) <- c("Double_Loss", "Loss", "Normal", "Gain", "Amplification")
+df.v2.long <- gather(df.clean.v2, cn_state, freq, Double_Loss:Amplification)
+
+# we want to display the boxplots in this order
+df.v2.long$cn_state = factor(df.v2.long$cn_state, levels = c("Double_Loss", "Loss", "Normal", "Gain", "Amplification"))
+
+# specify the order of boxplots (default is alphabetical order, which we don't want)
+df.v2.long$cn_state <- factor(
+    df.v2.long$cn_state, 
+    levels = c("Double_Loss", "Loss", "Normal", "Gain", "Amplification")
+)
+
+p <- ggplot(df.v2.long, aes(x=cn_state, y=freq)) + geom_boxplot() 
+p + theme(axis.text.x  = element_text(size=16, angle=90), axis.text.y  = element_text(size=16), axis.title.x = element_text(size = 20), axis.title.y = element_text(size = 20)) + labs(x = "\nCopy number state", y = "Frequency\n")
+```
+
+## Perform comparison with WGS data
+
+```{r}
+# we will use the lookup technique described in
+# http://nicercode.github.io/blog/2013-07-09-modifying-data-with-lookup-tables/
+# to map segment coordinates to gene names in an efficient manner
+library(tidyr)
+library(devtools, quietly=TRUE)
+source_gist("https://gist.github.com/dfalster/5589956")
+
+# first need to convert data to format that can be compared to WGS data
+# 1. wide to long
+# Note that we have cleaned the column header names since we are only interested in the sample name
+# These files have also been slightly modified so that the first column has the header "segment"
+calls_1.wide <- read.table("~/Documents/projects/GenomeCanada/CNV_for_Capture_analysis/CopywriteR/results/CNAprofiles_CAPTUREV1/CGHcall-calls.txt", sep="\t", header=TRUE)
+calls_2.wide <- read.table("~/Documents/projects/GenomeCanada/CNV_for_Capture_analysis/CopywriteR/results/CNAprofiles_CAPTUREV2/CGHcall-calls.txt", sep="\t", header=TRUE)
+calls_3.wide <- read.table("~/Documents/projects/GenomeCanada/CNV_for_Capture_analysis/CopywriteR/results/CNAprofiles_CAPTUREV3/CGHcall-calls.txt", sep="\t", header=TRUE)
+
+calls_1.long <- gather(calls_1.wide, sample, copy_number, GE0146:GE0221.N)
+calls_2.long <- gather(calls_2.wide, sample, copy_number, GE0004A:GE0283.N)
+calls_3.long <- gather(calls_3.wide, sample, copy_number, GE0078B:GE0448.N)
+
+write.table(calls_1.long, "~/Documents/projects/GenomeCanada/CNV_for_Capture_analysis/CopywriteR/results/CNAprofiles_CAPTUREV1/CGHcall-calls_long.txt", sep="\t")
+write.table(calls_2.long, "~/Documents/projects/GenomeCanada/CNV_for_Capture_analysis/CopywriteR/results/CNAprofiles_CAPTUREV2/CGHcall-calls_long.txt", sep="\t")
+write.table(calls_3.long, "~/Documents/projects/GenomeCanada/CNV_for_Capture_analysis/CopywriteR/results/CNAprofiles_CAPTUREV3/CGHcall-calls_long.txt", sep="\t")
+
+# mapping files for (1) segment coordinates to gene name, and (2) copy number (CGHcall) to copy state
+mappings_file <- "~/Documents/projects/GenomeCanada/CNV_for_Capture_analysis/CopywriteR/data/segment_to_gene_mappings_for_R.txt"
+mappings_file_for_CN <- "~/Documents/projects/GenomeCanada/CNV_for_Capture_analysis/CopywriteR/data/copy_number_to_state_mappings_for_R.txt"
+
+# Apply the mapping table to the copy number data
+allowedVars <- c("gene")
+calls_1.mapped <- addNewData(mappings_file, calls_1.long, allowedVars)
+calls_2.mapped <- addNewData(mappings_file, calls_2.long, allowedVars)
+calls_3.mapped <- addNewData(mappings_file, calls_3.long, allowedVars)
+
+# extract mappings that correspond to genes of interest (i.e. not NA)
+calls_1.targeted <- subset(calls_1.mapped, is.na(gene)==FALSE)
+calls_2.targeted <- subset(calls_2.mapped, is.na(gene)==FALSE)
+calls_3.targeted <- subset(calls_3.mapped, is.na(gene)==FALSE)
+
+# combine all the results into one file
+calls_all.targeted <- rbind(calls_1.targeted, calls_2.targeted, calls_3.targeted)
+# add column with copy state (Homozygous Loss, Loss, Neutral, Gain, Amplification)
+allowedVars <- c("copy_state")
+calls_all.mapped <- addNewData(mappings_file_for_CN, calls_all.targeted, allowedVars)
+
+# write out results
+write.table(calls_1.targeted, "~/Documents/projects/GenomeCanada/CNV_for_Capture_analysis/CopywriteR/results/CNAprofiles_CAPTUREV1/calls-target_genes.txt", sep="\t")
+write.table(calls_2.targeted, "~/Documents/projects/GenomeCanada/CNV_for_Capture_analysis/CopywriteR/results/CNAprofiles_CAPTUREV2/calls-target_genes.txt", sep="\t")
+write.table(calls_3.targeted, "~/Documents/projects/GenomeCanada/CNV_for_Capture_analysis/CopywriteR/results/CNAprofiles_CAPTUREV3/calls-target_genes.txt", sep="\t")
+
+# write out full set of results
+write.table(calls_all.mapped, "~/Documents/projects/GenomeCanada/CNV_for_Capture_analysis/CopywriteR/results/calls_all_samples-target_genes.txt", sep="\t")
+```
+
+## Plotting data for Capture data based on target space and copy states mapped
+
+```{r}
+library(ggplot2)
+library(RColorBrewer)
+
+# collapse segments so that we only have copy number data on a gene-basis
+# 1. remove first column (the segment column)
+drops <- c("segment")
+calls_all.mapped_no_segment <- calls_all.mapped[ , !(names(calls_all.mapped) %in% drops)]
+# 2. remove duplicate rows with the unique function
+calls.unique <- unique(calls_all.mapped_no_segment)
+write.table(calls.unique, "~/Documents/projects/GenomeCanada/CNV_for_Capture_analysis/CopywriteR/results/calls.unique.txt", sep="\t")
+
+# specify ordering of the copy states
+levels <- c("Amplification", "Gain", "Neutral", "Loss", "Homozygous Loss")
+calls.unique$copy_state <- factor(calls.unique$copy_state, levels=levels)
+# order the genes so that they appear alphabetically when plotted vertically
+calls.unique$gene <- factor(calls.unique$gene, levels=rev(calls.unique[order(calls.unique$gene), "gene"]))
+
+# plot counts of copy state amongst each gene (stacked bar plot)
+ggplot(calls.unique, aes(x=gene, fill=copy_state)) + geom_bar() + coord_flip() + scale_fill_brewer(type="div", palette="RdBu", name="Copy state") + labs(x = "\nGene", y = "Frequency\n")
+
+# plot with font sizes specified
+ggplot(calls.unique, aes(x=gene, fill=copy_state)) + geom_bar() + coord_flip() + scale_fill_brewer(type="div", palette="RdBu", name="Copy state") + labs(x = "\nGene", y = "Frequency\n") + theme(axis.text.x  = element_text(size=16), axis.text.y  = element_text(size=16), axis.title.x = element_text(size = 20), axis.title.y = element_text(size = 20), legend.text = element_text(size=16), legend.title = element_text(size=18))
+```
+
+## Subset the data to include only tumor samples
+
+```{r}
+library(devtools, quietly=TRUE)
+source_gist("https://gist.github.com/dfalster/5589956")
+
+mappings_for_normals <- "~/Documents/projects/GenomeCanada/CNV_for_Capture_analysis/CopywriteR/data/sample_to_tissue_type_mappings_for_R.txt"
+
+allowedVars <- c("tissue_type")
+calls.unique.v2 <- addNewData(mappings_for_normals, calls.unique, allowedVars)
+
+# now we can use the subset function to extract just tumor samples
+calls.tumors <- subset(calls.unique.v2, calls.unique.v2$tissue_type == 'tumor')
+calls.normals <- subset(calls.unique.v2, calls.unique.v2$tissue_type == 'normal')
+
+calls <- calls.normals
+
+# regenerate the stacked bar plot
+levels <- c("Amplification", "Gain", "Neutral", "Loss", "Homozygous Loss")
+calls$copy_state <- factor(calls$copy_state, levels=levels)
+calls$gene <- factor(calls$gene, levels=rev(calls[order(calls$gene), "gene"]))
+ggplot(calls, aes(x=gene, fill=copy_state)) + geom_bar() + coord_flip() + scale_fill_brewer(type="div", palette="RdBu", name="Copy state") + labs(x = "\nGene", y = "Frequency in tumor samples\n") + theme(axis.text.x  = element_text(size=16), axis.text.y  = element_text(size=16), axis.title.x = element_text(size = 20), axis.title.y = element_text(size = 20), legend.text = element_text(size=16), legend.title = element_text(size=18))
+```
+
+
+
+
